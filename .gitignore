@@ -1,0 +1,43 @@
+# Logs
+*.log
+
+# Binaries
+/agent
+/agent-cli
+/skull-*
+/mcp-server
+/programmatic
+*.exe
+
+# Go build cache
+.cache/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Config files with secrets
+config-production.yaml
+.env
+*.tk
+
+# Test coverage
+coverage.out
+
+# Temporary files
+/tmp/
+*.tmp
+*.bak
+*~
+
+# Development artifacts
+test.txt
+answer.txt
+test_malformed.go
+*.tmp
