@@ -6,31 +6,26 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/HeidiZHH/skull/internal/agent"
-	"github.com/HeidiZHH/skull/internal/scraper"
-	"github.com/HeidiZHH/skull/internal/summarizer"
+	"github.com/HeidiZHH/skull/internal/mcp"
+	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rs/zerolog"
 )
 
 // AgentCLI provides an interactive command-line interface
 type AgentCLI struct {
-	agent             *agent.Agent
-	scraperService    *scraper.Service
-	summarizerService *summarizer.Service
-	logger            zerolog.Logger
+	agent     *agent.Agent
+	mcpClient *gomcp.ClientSession
+	logger    zerolog.Logger
 }
 
-// NewAgentCLI creates a new CLI instance
-func NewAgentCLI(logger zerolog.Logger) (*AgentCLI, error) {
-	// Check for OpenAI API key
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		return nil, fmt.Errorf("OPENAI_API_KEY environment variable is required")
-	}
-
-	// Initialize agent
+// NewAgentCLI creates a new CLI instance that uses MCP
+func NewAgentCLI(logger zerolog.Logger, mcpSession *gomcp.ClientSession, apiKey string) (*AgentCLI, error) {
+	// Initialize agent with MCP tools
 	agentConfig := agent.Config{
 		Provider:    "openai",
 		APIKey:      apiKey,
@@ -39,34 +34,22 @@ func NewAgentCLI(logger zerolog.Logger) (*AgentCLI, error) {
 		MaxTokens:   1000,
 		Temperature: 0.2,
 	}
+
+	// Create agent
 	agentService := agent.NewAgent(agentConfig, logger)
 
-	// Initialize scraper service
-	scraperConfig := scraper.Config{
-		UserAgent:   "skull-agent/1.0",
-		Timeout:     30000000000, // 30 seconds
-		MaxRetries:  3,
-		RateLimit:   1000000000,       // 1 second
-		MaxBodySize: 10 * 1024 * 1024, // 10MB
-	}
-	scraperService := scraper.NewService(scraperConfig, logger)
-
-	// Initialize summarizer service
-	summarizerConfig := summarizer.Config{
-		Provider:  "openai",
-		APIKey:    apiKey,
-		BaseURL:   os.Getenv("OPENAI_BASE_URL"),
-		Model:     getEnvDefault("OPENAI_MODEL", "gpt-3.5-turbo"),
-		MaxTokens: 500,
-	}
-	summarizerService := summarizer.NewService(summarizerConfig, logger)
-
 	return &AgentCLI{
-		agent:             agentService,
-		scraperService:    scraperService,
-		summarizerService: summarizerService,
-		logger:            logger,
+		agent:     agentService,
+		mcpClient: mcpSession,
+		logger:    logger,
 	}, nil
+}
+
+// buildMCPServer builds the MCP server binary
+func buildMCPServer(workspaceRoot string) error {
+	cmd := exec.Command("go", "build", "-o", "mcp-server", "./cmd/mcp-server")
+	cmd.Dir = workspaceRoot
+	return cmd.Run()
 }
 
 // Run starts the interactive CLI
@@ -120,6 +103,14 @@ func (cli *AgentCLI) Run(ctx context.Context) error {
 	return nil
 }
 
+// Close properly shuts down the CLI and its resources
+func (cli *AgentCLI) Close() error {
+	if cli.mcpClient != nil {
+		return cli.mcpClient.Close()
+	}
+	return nil
+}
+
 // processUserInput handles a single user input
 func (cli *AgentCLI) processUserInput(ctx context.Context, userInput string) error {
 	fmt.Printf("🤔 Thinking...\n")
@@ -170,127 +161,24 @@ func (cli *AgentCLI) processUserInput(ctx context.Context, userInput string) err
 	return nil
 }
 
-// executeToolCall executes a specific tool call
-func (cli *AgentCLI) executeToolCall(ctx context.Context, toolCall agent.ToolCall) (string, error) {
-	switch toolCall.Name {
-	case "scrape_url":
-		return cli.executeScrapeURL(ctx, toolCall.Arguments)
-	case "summarize_content":
-		return cli.executeSummarizeContent(ctx, toolCall.Arguments)
-	case "scrape_and_summarize":
-		return cli.executeScrapeAndSummarize(ctx, toolCall.Arguments)
-	default:
-		return "", fmt.Errorf("unknown tool: %s", toolCall.Name)
-	}
-}
-
-// executeScrapeURL executes the scrape_url tool
-func (cli *AgentCLI) executeScrapeURL(ctx context.Context, args map[string]interface{}) (string, error) {
-	url, ok := args["url"].(string)
-	if !ok {
-		return "", fmt.Errorf("url parameter is required and must be a string")
-	}
-
-	selector, _ := args["selector"].(string)
-
-	result, err := cli.scraperService.ScrapeURL(ctx, url, selector)
+// executeToolCall executes a specific tool call using MCP
+func (cli *AgentCLI) executeToolCall(ctx context.Context, toolCall gomcp.CallToolParamsFor[any]) (string, error) {
+	// All tool calls now go through the MCP client
+	result, err := cli.mcpClient.CallTool(ctx, toolCall.Name, toolCall.Arguments)
 	if err != nil {
-		return "", fmt.Errorf("scraping failed: %w", err)
+		return "", fmt.Errorf("MCP tool call failed: %w", err)
 	}
 
-	return fmt.Sprintf("Successfully scraped %s\n\nTitle: %s\nContent length: %d characters\nLinks found: %d\nImages found: %d\n\nContent preview:\n%s",
-		result.URL,
-		result.Title,
-		len(result.CleanText),
-		len(result.Links),
-		len(result.Images),
-		truncateText(result.CleanText, 300),
-	), nil
-}
-
-// executeSummarizeContent executes the summarize_content tool
-func (cli *AgentCLI) executeSummarizeContent(ctx context.Context, args map[string]interface{}) (string, error) {
-	content, ok := args["content"].(string)
-	if !ok {
-		return "", fmt.Errorf("content parameter is required and must be a string")
+	if !result.Success {
+		return "", fmt.Errorf("tool execution failed: %s", result.Error)
 	}
 
-	maxLength := 200
-	if ml, ok := args["max_length"].(float64); ok {
-		maxLength = int(ml)
+	// Join all content strings
+	if len(result.Content) > 0 {
+		return strings.Join(result.Content, "\n"), nil
 	}
 
-	// Validate content
-	if err := cli.summarizerService.ValidateContent(content); err != nil {
-		return "", fmt.Errorf("content validation failed: %w", err)
-	}
-
-	req := summarizer.Request{
-		Content:   content,
-		MaxLength: maxLength,
-		Style:     "concise",
-	}
-
-	result, err := cli.summarizerService.Summarize(ctx, req)
-	if err != nil {
-		return "", fmt.Errorf("summarization failed: %w", err)
-	}
-
-	return fmt.Sprintf("Summary (using %s, %d tokens):\n\n%s\n\nOriginal: %d chars → Summary: %d chars",
-		result.Model,
-		result.TokensUsed,
-		result.Summary,
-		result.OriginalSize,
-		result.SummarySize,
-	), nil
-}
-
-// executeScrapeAndSummarize executes the scrape_and_summarize tool
-func (cli *AgentCLI) executeScrapeAndSummarize(ctx context.Context, args map[string]interface{}) (string, error) {
-	url, ok := args["url"].(string)
-	if !ok {
-		return "", fmt.Errorf("url parameter is required and must be a string")
-	}
-
-	maxLength := 200
-	if ml, ok := args["max_length"].(float64); ok {
-		maxLength = int(ml)
-	}
-
-	selector, _ := args["selector"].(string)
-
-	// First scrape
-	scrapeResult, err := cli.scraperService.ScrapeURL(ctx, url, selector)
-	if err != nil {
-		return "", fmt.Errorf("scraping failed: %w", err)
-	}
-
-	// Validate content
-	if err := cli.summarizerService.ValidateContent(scrapeResult.CleanText); err != nil {
-		return "", fmt.Errorf("content validation failed: %w", err)
-	}
-
-	// Then summarize
-	req := summarizer.Request{
-		Content:   scrapeResult.CleanText,
-		MaxLength: maxLength,
-		Style:     "concise",
-	}
-
-	summaryResult, err := cli.summarizerService.Summarize(ctx, req)
-	if err != nil {
-		return "", fmt.Errorf("summarization failed: %w", err)
-	}
-
-	return fmt.Sprintf("Scraped and summarized: %s\n\nTitle: %s\nSummary (using %s, %d tokens):\n\n%s\n\nOriginal: %d chars → Summary: %d chars",
-		scrapeResult.URL,
-		scrapeResult.Title,
-		summaryResult.Model,
-		summaryResult.TokensUsed,
-		summaryResult.Summary,
-		summaryResult.OriginalSize,
-		summaryResult.SummarySize,
-	), nil
+	return "Tool executed successfully", nil
 }
 
 // Helper functions
@@ -312,14 +200,71 @@ func main() {
 	// Create logger
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).With().Timestamp().Logger()
 
-	// Create CLI
-	cli, err := NewAgentCLI(logger)
-	if err != nil {
-		log.Fatalf("Failed to create CLI: %v", err)
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		log.Fatalf("OPENAI_API_KEY environment variable is required")
+		return
 	}
 
-	// Run the interactive CLI
+	serverConfig := &mcp.Config{
+		Server: mcp.ServerConfig{
+			Name:    "Skull MCP Server",
+			Version: "1.0.0",
+		},
+		Tools: mcp.ToolsConfig{
+			Scraper: mcp.ScraperConfig{
+				UserAgent:  "skull-agent/1.0",
+				Timeout:    30 * time.Second,
+				MaxRetries: 3,
+				RateLimit:  1 * time.Second,
+			},
+			Summarizer: mcp.SummarizerConfig{
+				Provider:  "deepseek",
+				Model:     os.Getenv("OPENAI_MODEL"),
+				MaxTokens: 500,
+				APIKey:    apiKey,
+			},
+		},
+	}
+	// Create and start the MCP server
+	server, err := mcp.NewServer(serverConfig, logger)
+	if err != nil {
+		log.Fatalf("Failed to create MCP server: %v", err)
+	}
+	clientTransport, serverTransport := gomcp.NewInMemoryTransports()
 	ctx := context.Background()
+	// Start the MCP server in a separate goroutine
+	go func() {
+		if err := server.Start(ctx, serverTransport); err != nil {
+			log.Fatalf("Server failed: %v", err)
+		}
+	}()
+	// Initialize MCP client
+	mcpClient := gomcp.NewClient(&gomcp.Implementation{
+		Name:    "Skull MCP Client",
+		Version: "1.0.0",
+	}, nil,
+	)
+
+	// Connect the MCP client to the server
+	mcpSession, err := mcpClient.Connect(ctx, clientTransport)
+	if err != nil {
+		log.Fatalf("Failed to connect MCP client: %v", err)
+		return
+	}
+	// Create CLI
+	cli, err := NewAgentCLI(logger, mcpSession, apiKey)
+	if err != nil {
+		log.Fatalf("Failed to create CLI: %v", err)
+		return
+	}
+	// Ensure proper cleanup
+	defer func() {
+		if err := cli.Close(); err != nil {
+			logger.Error().Err(err).Msg("Failed to close CLI properly")
+		}
+	}()
+	// Run the interactive CLI
 	if err := cli.Run(ctx); err != nil {
 		log.Fatalf("CLI failed: %v", err)
 	}

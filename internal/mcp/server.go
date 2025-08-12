@@ -14,14 +14,7 @@ import (
 
 // Config represents the server configuration
 type Config struct {
-	Server ServerConfig `yaml:"server"`
-	Tools  ToolsConfig  `yaml:"tools"`
-}
-
-// ServerConfig represents server-specific configuration
-type ServerConfig struct {
-	Name    string `yaml:"name"`
-	Version string `yaml:"version"`
+	Tools ToolsConfig `yaml:"tools"`
 }
 
 // ToolsConfig represents tools configuration
@@ -58,12 +51,15 @@ type Server struct {
 }
 
 // NewServer creates a new MCP server instance using the official SDK
-func NewServer(config *Config, logger zerolog.Logger) (*Server, error) {
+func NewServer(ctx context.Context, config *Config, logger zerolog.Logger) (*Server, error) {
 	// Create the implementation with our tools
-	impl := &mcp.Implementation{}
+	impl := &mcp.Implementation{
+		Name:    "Skull Web Scraper & Summarizer",
+		Version: "1.0.0",
+	}
 
 	// Create the official MCP server
-	mcpServer := mcp.NewServer(impl, &mcp.ServerOptions{})
+	mcpServer := mcp.NewServer(impl, nil)
 
 	// Initialize services
 	scraperConfig := scraper.Config{
@@ -99,33 +95,33 @@ func NewServer(config *Config, logger zerolog.Logger) (*Server, error) {
 	}
 
 	// Register tools
-	s.registerTools()
+	s.registerTools(mcpServer)
 
 	return s, nil
 }
 
 // registerTools registers all available tools with the MCP server
-func (s *Server) registerTools() {
+func (s *Server) registerTools(server *mcp.Server) {
 	// Register scrape_url tool
 	scrapeURLTool := &mcp.Tool{
 		Name:        "scrape_url",
 		Description: "Scrape content from a single URL",
 	}
-	mcp.AddTool(s.server, scrapeURLTool, s.handleScrapeURL)
+	mcp.AddTool(server, scrapeURLTool, s.handleScrapeURL)
 
 	// Register summarize_content tool
 	summarizeTool := &mcp.Tool{
 		Name:        "summarize_content",
 		Description: "Generate a summary of the provided text content",
 	}
-	mcp.AddTool(s.server, summarizeTool, s.handleSummarizeContent)
+	mcp.AddTool(server, summarizeTool, s.handleSummarizeContent)
 
 	// Register combined scrape_and_summarize tool
 	scrapeAndSummarizeTool := &mcp.Tool{
 		Name:        "scrape_and_summarize",
 		Description: "Scrape a URL and generate a summary of its content",
 	}
-	mcp.AddTool(s.server, scrapeAndSummarizeTool, s.handleScrapeAndSummarize)
+	mcp.AddTool(server, scrapeAndSummarizeTool, s.handleScrapeAndSummarize)
 }
 
 // Tool handlers - these implement the actual tool functionality
@@ -338,11 +334,7 @@ func (s *Server) handleScrapeAndSummarize(ctx context.Context, session *mcp.Serv
 }
 
 // Start starts the MCP server using stdio transport (standard for MCP)
-func (s *Server) Start(ctx context.Context) error {
-	s.logger.Info().Str("name", s.config.Server.Name).Str("version", s.config.Server.Version).Msg("Starting MCP server")
-
-	// Create stdio transport (standard for MCP servers)
-	transport := mcp.NewStdioTransport()
+func (s *Server) Start(ctx context.Context, transport mcp.Transport) error {
 
 	// Connect the server to the transport
 	conn, err := s.server.Connect(ctx, transport)
