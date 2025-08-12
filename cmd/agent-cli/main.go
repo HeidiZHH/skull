@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -36,7 +35,7 @@ func NewAgentCLI(logger zerolog.Logger, mcpSession *gomcp.ClientSession, apiKey 
 	}
 
 	// Create agent
-	agentService := agent.NewAgent(agentConfig, logger)
+	agentService := agent.NewAgent(logger, mcpSession, agentConfig)
 
 	return &AgentCLI{
 		agent:     agentService,
@@ -45,15 +44,21 @@ func NewAgentCLI(logger zerolog.Logger, mcpSession *gomcp.ClientSession, apiKey 
 	}, nil
 }
 
-// buildMCPServer builds the MCP server binary
-func buildMCPServer(workspaceRoot string) error {
-	cmd := exec.Command("go", "build", "-o", "mcp-server", "./cmd/mcp-server")
-	cmd.Dir = workspaceRoot
-	return cmd.Run()
+// getEnvDefault retrieves an environment variable or returns a default value
+func getEnvDefault(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	return value
 }
 
 // Run starts the interactive CLI
 func (cli *AgentCLI) Run(ctx context.Context) error {
+	if err := cli.agent.RefreshTools(ctx); err != nil {
+		return fmt.Errorf("failed to refresh tools: %w", err)
+	}
+
 	fmt.Println("🧠 Skull AI Agent - Web Scraping & Summarization Assistant")
 	fmt.Println("=========================================================")
 	fmt.Println()
@@ -80,8 +85,8 @@ func (cli *AgentCLI) Run(ctx context.Context) error {
 		}
 
 		userInput := strings.TrimSpace(scanner.Text())
-
 		if userInput == "" {
+			fmt.Println("❌ Please enter a valid query.")
 			continue
 		}
 
@@ -90,10 +95,28 @@ func (cli *AgentCLI) Run(ctx context.Context) error {
 			break
 		}
 
-		// Process the user input with the agent
-		if err := cli.processUserInput(ctx, userInput); err != nil {
+		// Process the user query
+		fmt.Print("🤔 Thinking... ")
+		response, err := cli.agent.ProcessQuery(ctx, userInput)
+		if err != nil {
 			fmt.Printf("❌ Error: %v\n\n", err)
+			continue
 		}
+
+		// Clear the "Thinking..." line
+		fmt.Print("\r")
+
+		// Display the response
+		if response.Response != "" {
+			fmt.Printf("🤖 Agent: %s\n", response.Response)
+		}
+
+		// If tools were used, optionally show tool information
+		if len(response.ToolCalls) > 0 {
+			fmt.Printf("🔧 Used %d tool(s) to answer your question.\n", len(response.ToolCalls))
+		}
+
+		fmt.Println()
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -111,95 +134,10 @@ func (cli *AgentCLI) Close() error {
 	return nil
 }
 
-// processUserInput handles a single user input
-func (cli *AgentCLI) processUserInput(ctx context.Context, userInput string) error {
-	fmt.Printf("🤔 Thinking...\n")
-
-	// Let the agent analyze the input
-	response, err := cli.agent.ProcessInput(ctx, userInput)
-	if err != nil {
-		return fmt.Errorf("agent processing failed: %w", err)
-	}
-
-	// Show the agent's understanding
-	fmt.Printf("🧠 Agent: %s\n", response.Message)
-
-	if response.Confidence < 0.5 {
-		fmt.Printf("⚠️  Confidence: %.1f%% - I'm not very confident about this interpretation.\n", response.Confidence*100)
-	}
-
-	// If no tools should be called, we're done
-	if !response.ShouldCall || len(response.ToolCalls) == 0 {
-		fmt.Printf("💭 %s\n\n", response.Explanation)
-		return nil
-	}
-
-	// Execute tool calls
-	fmt.Printf("🔧 Executing %d tool(s)...\n", len(response.ToolCalls))
-
-	for i, toolCall := range response.ToolCalls {
-		fmt.Printf("\n🛠️  Tool %d/%d: %s\n", i+1, len(response.ToolCalls), toolCall.Name)
-		fmt.Printf("📝 Reasoning: %s\n", toolCall.Reasoning)
-
-		// Validate the tool call
-		if err := cli.agent.ValidateToolCall(toolCall); err != nil {
-			fmt.Printf("❌ Validation failed: %v\n", err)
-			continue
-		}
-
-		// Execute the tool call
-		result, err := cli.executeToolCall(ctx, toolCall)
-		if err != nil {
-			fmt.Printf("❌ Execution failed: %v\n", err)
-			continue
-		}
-
-		fmt.Printf("✅ Result: %s\n", result)
-	}
-
-	fmt.Println()
-	return nil
-}
-
-// executeToolCall executes a specific tool call using MCP
-func (cli *AgentCLI) executeToolCall(ctx context.Context, toolCall gomcp.CallToolParamsFor[any]) (string, error) {
-	// All tool calls now go through the MCP client
-	result, err := cli.mcpClient.CallTool(ctx, toolCall.Name, toolCall.Arguments)
-	if err != nil {
-		return "", fmt.Errorf("MCP tool call failed: %w", err)
-	}
-
-	if !result.Success {
-		return "", fmt.Errorf("tool execution failed: %s", result.Error)
-	}
-
-	// Join all content strings
-	if len(result.Content) > 0 {
-		return strings.Join(result.Content, "\n"), nil
-	}
-
-	return "Tool executed successfully", nil
-}
-
-// Helper functions
-func getEnvDefault(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-func truncateText(text string, maxLen int) string {
-	if len(text) <= maxLen {
-		return text
-	}
-	return text[:maxLen] + "..."
-}
-
 func main() {
 	// Create logger
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).With().Timestamp().Logger()
-
+	ctx := context.Background()
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
 		log.Fatalf("OPENAI_API_KEY environment variable is required")
@@ -207,10 +145,6 @@ func main() {
 	}
 
 	serverConfig := &mcp.Config{
-		Server: mcp.ServerConfig{
-			Name:    "Skull MCP Server",
-			Version: "1.0.0",
-		},
 		Tools: mcp.ToolsConfig{
 			Scraper: mcp.ScraperConfig{
 				UserAgent:  "skull-agent/1.0",
@@ -227,12 +161,12 @@ func main() {
 		},
 	}
 	// Create and start the MCP server
-	server, err := mcp.NewServer(serverConfig, logger)
+	server, err := mcp.NewServer(ctx, serverConfig, logger)
 	if err != nil {
 		log.Fatalf("Failed to create MCP server: %v", err)
 	}
 	clientTransport, serverTransport := gomcp.NewInMemoryTransports()
-	ctx := context.Background()
+
 	// Start the MCP server in a separate goroutine
 	go func() {
 		if err := server.Start(ctx, serverTransport); err != nil {
