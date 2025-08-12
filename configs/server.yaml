@@ -9,10 +9,3 @@ tools:
     maxRetries: 3
     rateLimit: 1s
     maxBodySize: 10485760  # 10MB
-
-  summarizer:
-    provider: "openai"
-    apiKey: "${OPENAI_API_KEY}"  # Will be read from environment
-    baseURL: ""  # Leave empty for OpenAI, or set to custom endpoint like "http://localhost:1234/v1"
-    model: "gpt-3.5-turbo"
-    maxTokens: 500

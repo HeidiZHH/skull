@@ -152,12 +152,6 @@ func main() {
 				MaxRetries: 3,
 				RateLimit:  1 * time.Second,
 			},
-			Summarizer: mcp.SummarizerConfig{
-				Provider:  "deepseek",
-				Model:     os.Getenv("OPENAI_MODEL"),
-				MaxTokens: 500,
-				APIKey:    apiKey,
-			},
 		},
 	}
 	// Create and start the MCP server

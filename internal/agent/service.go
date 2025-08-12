@@ -234,6 +234,12 @@ func (a *Agent) executeTools(ctx context.Context, toolCalls []*mcp.CallToolParam
 			Str("tool_name", toolCall.Name).
 			Bool("is_error", result.IsError).
 			Msg("Tool execution completed")
+
+		a.logger.Info().
+			Str("tool_name", toolCall.Name).
+			Str("structured_content", fmt.Sprintf("%+v", result.StructuredContent)).
+			Msg("Tool result")
+
 	}
 
 	return results, nil
