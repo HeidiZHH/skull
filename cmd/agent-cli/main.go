@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -11,33 +12,45 @@ import (
 	"github.com/HeidiZHH/skull/internal/agent"
 	"github.com/HeidiZHH/skull/internal/scraper"
 	"github.com/HeidiZHH/skull/internal/summarizer"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rs/zerolog"
 )
 
 // AgentCLI provides an interactive command-line interface
 type AgentCLI struct {
-	agent             *agent.Agent
-	scraperService    *scraper.Service
-	summarizerService *summarizer.Service
-	logger            zerolog.Logger
+	agent              *agent.Agent
+	scraperService     *scraper.Service
+	summarizerService  *summarizer.Service
+	logger             zerolog.Logger
+	lastScrapedContent string
 }
 
 // NewAgentCLI creates a new CLI instance
 func NewAgentCLI(logger zerolog.Logger) (*AgentCLI, error) {
-	// Check for OpenAI API key
+	// Require OPENAI_API_KEY; used for OpenAI-compatible providers (including DeepSeek)
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
 		return nil, fmt.Errorf("OPENAI_API_KEY environment variable is required")
 	}
 
 	// Initialize agent
+	baseURL := os.Getenv("OPENAI_BASE_URL")
+	if baseURL == "" {
+		// Default to DeepSeek's OpenAI-compatible endpoint if not provided
+		baseURL = "https://api.deepseek.com/v1"
+	}
+	model := getEnvDefault("OPENAI_MODEL", "gpt-3.5-turbo")
+	if strings.Contains(strings.ToLower(baseURL), "deepseek.com") && os.Getenv("OPENAI_MODEL") == "" {
+		model = "deepseek-chat"
+	}
 	agentConfig := agent.Config{
 		Provider:    "openai",
 		APIKey:      apiKey,
-		BaseURL:     os.Getenv("OPENAI_BASE_URL"), // Optional custom endpoint
-		Model:       getEnvDefault("OPENAI_MODEL", "gpt-3.5-turbo"),
+		BaseURL:     baseURL, // Supports DeepSeek or custom endpoints
+		Model:       model,
 		MaxTokens:   1000,
 		Temperature: 0.2,
+		MCPServer:   os.Getenv("MCP_SERVER"), // e.g. http://localhost:8080
 	}
 	agentService := agent.NewAgent(agentConfig, logger)
 
@@ -55,8 +68,8 @@ func NewAgentCLI(logger zerolog.Logger) (*AgentCLI, error) {
 	summarizerConfig := summarizer.Config{
 		Provider:  "openai",
 		APIKey:    apiKey,
-		BaseURL:   os.Getenv("OPENAI_BASE_URL"),
-		Model:     getEnvDefault("OPENAI_MODEL", "gpt-3.5-turbo"),
+		BaseURL:   baseURL,
+		Model:     model,
 		MaxTokens: 500,
 	}
 	summarizerService := summarizer.NewService(summarizerConfig, logger)
@@ -193,19 +206,50 @@ func (cli *AgentCLI) executeScrapeURL(ctx context.Context, args map[string]inter
 
 	selector, _ := args["selector"].(string)
 
-	result, err := cli.scraperService.ScrapeURL(ctx, url, selector)
-	if err != nil {
-		return "", fmt.Errorf("scraping failed: %w", err)
+	// Execute remotely via MCP server
+	endpoint := os.Getenv("MCP_SERVER")
+	if endpoint == "" {
+		return "", fmt.Errorf("MCP_SERVER is not set; cannot call remote tool")
 	}
 
-	return fmt.Sprintf("Successfully scraped %s\n\nTitle: %s\nContent length: %d characters\nLinks found: %d\nImages found: %d\n\nContent preview:\n%s",
-		result.URL,
-		result.Title,
-		len(result.CleanText),
-		len(result.Links),
-		len(result.Images),
-		truncateText(result.CleanText, 300),
-	), nil
+	client := mcp.NewClient(&mcp.Implementation{Name: "skull-agent-cli"}, nil)
+	transport := &mcp.SSEClientTransport{Endpoint: endpoint}
+	session, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to connect to MCP server: %w", err)
+	}
+	defer session.Close()
+
+	params := &mcp.CallToolParams{
+		Name:      "scrape_url",
+		Arguments: map[string]any{"url": url, "selector": selector},
+	}
+	res, err := session.CallTool(ctx, params)
+	if err != nil {
+		return "", fmt.Errorf("remote tool call failed: %w", err)
+	}
+	// Extract human-readable message from content
+	var msgParts []string
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			msgParts = append(msgParts, tc.Text)
+		}
+	}
+	// Capture structured content if available
+	var preview string
+	if res.StructuredContent != nil {
+		if m, ok := res.StructuredContent.(map[string]any); ok {
+			if s, ok := m["content"].(string); ok {
+				cli.lastScrapedContent = s
+				preview = truncateText(s, 300)
+			}
+		}
+	}
+	out := strings.Join(msgParts, "\n\n")
+	if preview != "" {
+		out += "\n\nContent preview:\n" + preview
+	}
+	return out, nil
 }
 
 // executeSummarizeContent executes the summarize_content tool
@@ -312,6 +356,10 @@ func main() {
 	// Create logger
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).With().Timestamp().Logger()
 
+	// Optional single-run input flag for non-interactive testing
+	input := flag.String("input", "", "Process a single input then exit (non-interactive mode)")
+	flag.Parse()
+
 	// Create CLI
 	cli, err := NewAgentCLI(logger)
 	if err != nil {
@@ -320,6 +368,14 @@ func main() {
 
 	// Run the interactive CLI
 	ctx := context.Background()
+	if *input != "" {
+		// Non-interactive single-run
+		if err := cli.processUserInput(ctx, *input); err != nil {
+			log.Fatalf("CLI failed: %v", err)
+		}
+		return
+	}
+
 	if err := cli.Run(ctx); err != nil {
 		log.Fatalf("CLI failed: %v", err)
 	}
