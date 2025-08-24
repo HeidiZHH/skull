@@ -6,7 +6,7 @@ toolchain go1.24.5
 
 require (
 	github.com/gocolly/colly/v2 v2.2.0
-	github.com/modelcontextprotocol/go-sdk v0.2.0
+	github.com/modelcontextprotocol/go-sdk v0.3.0
 	github.com/rs/zerolog v1.31.0
 	github.com/sashabaranov/go-openai v1.40.5
 )
@@ -21,6 +21,7 @@ require (
 	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
+	github.com/google/jsonschema-go v0.2.0 // indirect
 	github.com/kennygrant/sanitize v1.2.4 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect

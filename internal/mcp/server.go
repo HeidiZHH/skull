@@ -3,11 +3,9 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/HeidiZHH/skull/internal/scraper"
-	"github.com/HeidiZHH/skull/internal/summarizer"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rs/zerolog"
 )
@@ -26,8 +24,7 @@ type ServerConfig struct {
 
 // ToolsConfig represents tools configuration
 type ToolsConfig struct {
-	Scraper    ScraperConfig    `yaml:"scraper"`
-	Summarizer SummarizerConfig `yaml:"summarizer"`
+	Scraper ScraperConfig `yaml:"scraper"`
 }
 
 // ScraperConfig represents web scraper configuration
@@ -39,22 +36,12 @@ type ScraperConfig struct {
 	MaxBodySize int64         `yaml:"maxBodySize"`
 }
 
-// SummarizerConfig represents summarizer configuration
-type SummarizerConfig struct {
-	Provider  string `yaml:"provider"`
-	APIKey    string `yaml:"apiKey"`
-	BaseURL   string `yaml:"baseURL"`
-	Model     string `yaml:"model"`
-	MaxTokens int    `yaml:"maxTokens"`
-}
-
 // Server represents the MCP server using the official SDK
 type Server struct {
-	config            *Config
-	logger            zerolog.Logger
-	server            *mcp.Server
-	scraperService    *scraper.Service
-	summarizerService *summarizer.Service
+	config         *Config
+	logger         zerolog.Logger
+	server         *mcp.Server
+	scraperService *scraper.Service
 }
 
 // NewServer creates a new MCP server instance using the official SDK
@@ -75,27 +62,11 @@ func NewServer(config *Config, logger zerolog.Logger) (*Server, error) {
 	}
 	scraperService := scraper.NewService(scraperConfig, logger)
 
-	// Get API key from environment if not set
-	apiKey := config.Tools.Summarizer.APIKey
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENAI_API_KEY")
-	}
-
-	summarizerConfig := summarizer.Config{
-		Provider:  config.Tools.Summarizer.Provider,
-		APIKey:    apiKey,
-		BaseURL:   config.Tools.Summarizer.BaseURL,
-		Model:     config.Tools.Summarizer.Model,
-		MaxTokens: config.Tools.Summarizer.MaxTokens,
-	}
-	summarizerService := summarizer.NewService(summarizerConfig, logger)
-
 	s := &Server{
-		config:            config,
-		logger:            logger,
-		server:            mcpServer,
-		scraperService:    scraperService,
-		summarizerService: summarizerService,
+		config:         config,
+		logger:         logger,
+		server:         mcpServer,
+		scraperService: scraperService,
 	}
 
 	// Register tools
@@ -113,19 +84,6 @@ func (s *Server) registerTools() {
 	}
 	mcp.AddTool(s.server, scrapeURLTool, s.handleScrapeURL)
 
-	// Register summarize_content tool
-	summarizeTool := &mcp.Tool{
-		Name:        "summarize_content",
-		Description: "Generate a summary of the provided text content",
-	}
-	mcp.AddTool(s.server, summarizeTool, s.handleSummarizeContent)
-
-	// Register combined scrape_and_summarize tool
-	scrapeAndSummarizeTool := &mcp.Tool{
-		Name:        "scrape_and_summarize",
-		Description: "Scrape a URL and generate a summary of its content",
-	}
-	mcp.AddTool(s.server, scrapeAndSummarizeTool, s.handleScrapeAndSummarize)
 }
 
 // Tool handlers - these implement the actual tool functionality
@@ -172,167 +130,6 @@ func (s *Server) handleScrapeURL(ctx context.Context, session *mcp.ServerSession
 		StructuredContent: ScrapeURLResult{
 			Content: result.CleanText,
 			URL:     result.URL,
-		},
-	}, nil
-}
-
-// SummarizeContentParams represents the parameters for summarize_content tool
-type SummarizeContentParams struct {
-	Content   string `json:"content"`
-	MaxLength int    `json:"max_length,omitempty"`
-}
-
-// SummarizeContentResult represents the result of summarize_content tool
-type SummarizeContentResult struct {
-	Summary   string `json:"summary"`
-	Length    int    `json:"length"`
-	MaxLength int    `json:"max_length"`
-}
-
-// handleSummarizeContent handles the summarize_content tool
-func (s *Server) handleSummarizeContent(ctx context.Context, session *mcp.ServerSession, params *mcp.CallToolParamsFor[SummarizeContentParams]) (*mcp.CallToolResultFor[SummarizeContentResult], error) {
-	content := params.Arguments.Content
-	maxLength := params.Arguments.MaxLength
-	if maxLength == 0 {
-		maxLength = 200
-	}
-
-	s.logger.Info().Int("max_length", maxLength).Msg("Summarizing content")
-
-	// Validate content
-	if err := s.summarizerService.ValidateContent(content); err != nil {
-		return &mcp.CallToolResultFor[SummarizeContentResult]{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: fmt.Sprintf("Content validation error: %v", err),
-				},
-			},
-			IsError: true,
-		}, nil
-	}
-
-	// Use the actual summarizer service
-	req := summarizer.Request{
-		Content:   content,
-		MaxLength: maxLength,
-		Style:     "concise",
-	}
-
-	summaryResult, err := s.summarizerService.Summarize(ctx, req)
-	if err != nil {
-		return &mcp.CallToolResultFor[SummarizeContentResult]{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: fmt.Sprintf("Error generating summary: %v", err),
-				},
-			},
-			IsError: true,
-		}, nil
-	}
-
-	return &mcp.CallToolResultFor[SummarizeContentResult]{
-		Content: []mcp.Content{
-			&mcp.TextContent{
-				Text: fmt.Sprintf("Summary (using %s, %d tokens):\n\n%s",
-					summaryResult.Model, summaryResult.TokensUsed, summaryResult.Summary),
-			},
-		},
-		StructuredContent: SummarizeContentResult{
-			Summary:   summaryResult.Summary,
-			Length:    summaryResult.SummarySize,
-			MaxLength: maxLength,
-		},
-	}, nil
-}
-
-// ScrapeAndSummarizeParams represents the parameters for scrape_and_summarize tool
-type ScrapeAndSummarizeParams struct {
-	URL       string `json:"url"`
-	MaxLength int    `json:"max_length,omitempty"`
-	Selector  string `json:"selector,omitempty"`
-}
-
-// ScrapeAndSummarizeResult represents the result of scrape_and_summarize tool
-type ScrapeAndSummarizeResult struct {
-	Summary   string `json:"summary"`
-	URL       string `json:"url"`
-	Length    int    `json:"length"`
-	MaxLength int    `json:"max_length"`
-}
-
-// handleScrapeAndSummarize handles the combined scrape_and_summarize tool
-func (s *Server) handleScrapeAndSummarize(ctx context.Context, session *mcp.ServerSession, params *mcp.CallToolParamsFor[ScrapeAndSummarizeParams]) (*mcp.CallToolResultFor[ScrapeAndSummarizeResult], error) {
-	url := params.Arguments.URL
-	maxLength := params.Arguments.MaxLength
-	if maxLength == 0 {
-		maxLength = 200
-	}
-	selector := params.Arguments.Selector
-
-	s.logger.Info().
-		Str("url", url).
-		Str("selector", selector).
-		Int("max_length", maxLength).
-		Msg("Scraping and summarizing URL")
-
-	// First, scrape the URL
-	scrapeResult, err := s.scraperService.ScrapeURL(ctx, url, selector)
-	if err != nil {
-		return &mcp.CallToolResultFor[ScrapeAndSummarizeResult]{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: fmt.Sprintf("Error scraping URL: %v", err),
-				},
-			},
-			IsError: true,
-		}, nil
-	}
-
-	// Validate scraped content
-	if err := s.summarizerService.ValidateContent(scrapeResult.CleanText); err != nil {
-		return &mcp.CallToolResultFor[ScrapeAndSummarizeResult]{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: fmt.Sprintf("Scraped content validation error: %v", err),
-				},
-			},
-			IsError: true,
-		}, nil
-	}
-
-	// Then, summarize the content
-	req := summarizer.Request{
-		Content:   scrapeResult.CleanText,
-		MaxLength: maxLength,
-		Style:     "concise",
-	}
-
-	summaryResult, err := s.summarizerService.Summarize(ctx, req)
-	if err != nil {
-		return &mcp.CallToolResultFor[ScrapeAndSummarizeResult]{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: fmt.Sprintf("Error generating summary: %v", err),
-				},
-			},
-			IsError: true,
-		}, nil
-	}
-
-	result := fmt.Sprintf("Scraped and summarized: %s\n\nTitle: %s\n\nSummary (using %s, %d tokens):\n%s",
-		url, scrapeResult.Title, summaryResult.Model, summaryResult.TokensUsed, summaryResult.Summary)
-
-	return &mcp.CallToolResultFor[ScrapeAndSummarizeResult]{
-		Content: []mcp.Content{
-			&mcp.TextContent{
-				Text: result,
-			},
-		},
-		StructuredContent: ScrapeAndSummarizeResult{
-			Summary:   summaryResult.Summary,
-			URL:       url,
-			Length:    summaryResult.SummarySize,
-			MaxLength: maxLength,
 		},
 	}, nil
 }
